@@ -126,7 +126,7 @@ struct SampleMeta {
     pack_index: usize,
     record_index: u64,
     ply: u16,
-    kingrank_bucket: u8,
+    kingrank_bucket: u16,
     friend_zone3: u8,
     board_non_king_count: u8,
 }

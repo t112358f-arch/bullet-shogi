@@ -11,7 +11,11 @@ use crate::shogi::{
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
     const BUCKETS: usize;
 
-    fn bucket(&self, pos: &T) -> u8;
+    fn buckets(&self) -> usize {
+        Self::BUCKETS
+    }
+
+    fn bucket(&self, pos: &T) -> u16;
 }
 
 #[deprecated(note = "You do not need to specify this anymore, it is the default!")]
@@ -22,7 +26,7 @@ pub struct Single;
 impl<T: 'static> OutputBuckets<T> for Single {
     const BUCKETS: usize = 1;
 
-    fn bucket(&self, _: &T) -> u8 {
+    fn bucket(&self, _: &T) -> u16 {
         0
     }
 }
@@ -32,18 +36,18 @@ pub struct MaterialCount<const N: usize>;
 impl<const N: usize> OutputBuckets<ChessBoard> for MaterialCount<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &ChessBoard) -> u8 {
+    fn bucket(&self, pos: &ChessBoard) -> u16 {
         let divisor = 32usize.div_ceil(N);
-        (pos.occ().count_ones() as u8 - 2) / divisor as u8
+        ((pos.occ().count_ones() as u8 - 2) / divisor as u8) as u16
     }
 }
 
 impl<const N: usize> OutputBuckets<MarlinFormat> for MaterialCount<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &MarlinFormat) -> u8 {
+    fn bucket(&self, pos: &MarlinFormat) -> u16 {
         let divisor = 32usize.div_ceil(N);
-        (pos.occ().count_ones() as u8 - 2) / divisor as u8
+        ((pos.occ().count_ones() as u8 - 2) / divisor as u8) as u16
     }
 }
 
@@ -65,7 +69,7 @@ pub struct ShogiKingRankBucket<const N: usize>;
 impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         let board = pos.decode();
 
         let side_to_move = board.side_to_move;
@@ -88,7 +92,116 @@ impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
         const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
 
         let bucket = F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)];
-        bucket.min(N - 1) as u8
+        bucket.min(N - 1) as u16
+    }
+}
+
+struct ShogiKingBucketTableData {
+    num_half_buckets: usize,
+    num_buckets: usize,
+    index: Box<[u16]>,
+}
+
+static SHOGI_KING_BUCKET_TABLE: OnceLock<ShogiKingBucketTableData> = OnceLock::new();
+
+/// Runtime king-pair bucket table for shogi LayerStacks.
+///
+/// The readable table is written in normal shogi-board orientation:
+/// row 0 is rank 1, row 8 is rank 9, column 0 is file 9, column 8 is file 1.
+/// Each value is a half-bucket id. The final output bucket is
+/// `friend_half * num_half_buckets + enemy_half`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiKingBucketTable;
+
+impl ShogiKingBucketTable {
+    fn data() -> &'static ShogiKingBucketTableData {
+        SHOGI_KING_BUCKET_TABLE.get().expect("Shogi king bucket table has not been loaded")
+    }
+
+    fn readable_index_from_square(sq: crate::shogi::Square) -> usize {
+        sq.rank() as usize * 9 + (8 - sq.file() as usize)
+    }
+
+    pub fn load_from_readable_table(num_half_buckets: usize, table: &[Vec<u8>]) -> Result<Self, String> {
+        if num_half_buckets == 0 {
+            return Err("num_half_buckets must be greater than 0".to_string());
+        }
+        let num_buckets = num_half_buckets
+            .checked_mul(num_half_buckets)
+            .ok_or_else(|| "num_half_buckets squared overflowed".to_string())?;
+        if num_buckets > u16::MAX as usize + 1 {
+            return Err(format!("num_half_buckets^2 must be <= 65536 (got {num_buckets})"));
+        }
+        if table.len() != 9 || table.iter().any(|row| row.len() != 9) {
+            return Err(format!("table must be 9x9 (got {} rows)", table.len()));
+        }
+
+        let mut own_half_bucket = [0u8; 81];
+        for sq_idx in 0..81 {
+            let sq = crate::shogi::Square::from_index(sq_idx);
+            let readable_idx = Self::readable_index_from_square(sq);
+            let value = table[readable_idx / 9][readable_idx % 9];
+            if value as usize >= num_half_buckets {
+                return Err(format!(
+                    "table value out of range at square index {sq_idx}: {value} (num_half_buckets={num_half_buckets})"
+                ));
+            }
+            own_half_bucket[sq_idx] = value;
+        }
+
+        let mut index = vec![0u16; 2 * 81 * 81];
+        for stm in [Color::Black, Color::White] {
+            let stm_i = stm as usize;
+            for f_king in 0..81 {
+                for e_king in 0..81 {
+                    let f_sq = match stm {
+                        Color::Black => crate::shogi::Square::from_index(f_king),
+                        Color::White => crate::shogi::Square::from_index(f_king).inverse(),
+                    };
+                    let e_sq = match stm {
+                        Color::Black => crate::shogi::Square::from_index(e_king),
+                        Color::White => crate::shogi::Square::from_index(e_king).inverse(),
+                    };
+                    let f_half = own_half_bucket[f_sq.index()] as usize;
+                    let e_half = own_half_bucket[e_sq.inverse().index()] as usize;
+                    let bucket = f_half * num_half_buckets + e_half;
+                    index[(stm_i * 81 + f_king) * 81 + e_king] = bucket as u16;
+                }
+            }
+        }
+
+        SHOGI_KING_BUCKET_TABLE
+            .set(ShogiKingBucketTableData { num_half_buckets, num_buckets, index: index.into_boxed_slice() })
+            .map_err(|_| "shogi king bucket table is already loaded in this process".to_string())?;
+
+        Ok(Self)
+    }
+
+    pub fn num_half_buckets(&self) -> usize {
+        Self::data().num_half_buckets
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiKingBucketTable {
+    const BUCKETS: usize = 0;
+
+    fn buckets(&self) -> usize {
+        Self::data().num_buckets
+    }
+
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
+        let board = pos.decode();
+        let side_to_move = board.side_to_move;
+        let f_king = board.king_square(side_to_move);
+        let e_king = board.king_square(side_to_move.opponent());
+        if !f_king.is_valid() || !e_king.is_valid() {
+            return 0;
+        }
+
+        let data = Self::data();
+        let idx = (side_to_move as usize * 81 + f_king.index()) * 81 + e_king.index();
+        let bucket = data.index[idx] as usize;
+        bucket.min(data.num_buckets - 1) as u16
     }
 }
 
@@ -224,10 +337,10 @@ impl Default for ShogiProgressBucket8 {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressBucket8 {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as u16
     }
 }
 
@@ -333,10 +446,10 @@ impl ShogiProgressKPAbs {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressKPAbs {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as u16
     }
 }
 
@@ -517,10 +630,10 @@ impl Default for ShogiProgressBucket8GikouLite {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressBucket8GikouLite {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as u16
     }
 }
 
@@ -545,11 +658,11 @@ impl Default for ShogiPlyBucket9 {
 impl OutputBuckets<PackedSfenValue> for ShogiPlyBucket9 {
     const BUCKETS: usize = 9;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         let ply = pos.game_ply();
         for (i, &bound) in self.bounds.iter().enumerate() {
             if ply <= bound {
-                return i as u8;
+                return i as u16;
             }
         }
         8
@@ -565,6 +678,7 @@ impl OutputBuckets<PackedSfenValue> for ShogiPlyBucket9 {
 pub enum ShogiLayerStackBucket9 {
     #[default]
     KingRank9,
+    KingBucketTable(ShogiKingBucketTable),
     Ply9([u16; 8]),
     Progress8(ShogiProgressBucket8),
     Progress8GikouLite(ShogiProgressBucket8GikouLite),
@@ -574,14 +688,22 @@ pub enum ShogiLayerStackBucket9 {
 impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
     const BUCKETS: usize = 9;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn buckets(&self) -> usize {
+        match self {
+            Self::KingBucketTable(table) => table.buckets(),
+            _ => 9,
+        }
+    }
+
+    fn bucket(&self, pos: &PackedSfenValue) -> u16 {
         match self {
             Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
+            Self::KingBucketTable(table) => table.bucket(pos),
             Self::Ply9(bounds) => {
                 let ply = pos.game_ply();
                 for (i, &bound) in bounds.iter().enumerate() {
                     if ply <= bound {
-                        return i as u8;
+                        return i as u16;
                     }
                 }
                 8

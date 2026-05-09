@@ -198,7 +198,7 @@ impl Bucket for NoOutputBuckets {
 impl<T: 'static> OutputBuckets<T> for NoOutputBuckets {
     const BUCKETS: usize = 1;
 
-    fn bucket(&self, _: &T) -> u8 {
+    fn bucket(&self, _: &T) -> u16 {
         0
     }
 }
@@ -251,7 +251,7 @@ where
         self,
         buckets: Out,
     ) -> ValueTrainerBuilder<O, I, P, OutputBucket<Out>> {
-        assert!(Out::BUCKETS > 1, "The output bucket type must have more than 1 bucket!");
+        assert!(buckets.buckets() > 1, "The output bucket type must have more than 1 bucket!");
 
         ValueTrainerBuilder {
             input_getter: self.input_getter,
@@ -316,9 +316,10 @@ where
     where
         F: for<'a> Fn(Nb<'a>, Nbn<'a>, Nbn<'a>) -> Nbn<'a>,
     {
+        let bucket_count = self.output_buckets.0.buckets();
         self.build_internal(|inputs, nnz, builder| {
             let stm = builder.new_sparse_input("stm", Shape::new(inputs, 1), nnz);
-            let buckets = builder.new_sparse_input("buckets", Shape::new(Out::BUCKETS, 1), 1);
+            let buckets = builder.new_sparse_input("buckets", Shape::new(bucket_count, 1), 1);
             f(builder, stm, buckets)
         })
     }
@@ -334,10 +335,11 @@ where
     where
         F: for<'a> Fn(Nb<'a>, Nbn<'a>, Nbn<'a>, Nbn<'a>) -> Nbn<'a>,
     {
+        let bucket_count = self.output_buckets.0.buckets();
         self.build_internal(|inputs, nnz, builder| {
             let stm = builder.new_sparse_input("stm", Shape::new(inputs, 1), nnz);
             let ntm = builder.new_sparse_input("nstm", Shape::new(inputs, 1), nnz);
-            let buckets = builder.new_sparse_input("buckets", Shape::new(Out::BUCKETS, 1), 1);
+            let buckets = builder.new_sparse_input("buckets", Shape::new(bucket_count, 1), 1);
             f(builder, stm, ntm, buckets)
         })
     }
@@ -388,10 +390,11 @@ where
     where
         F: for<'a> Fn(Nb<'a>, (Nbn<'a>, Nbn<'a>), Nbn<'a>) -> (Nbn<'a>, Nbn<'a>),
     {
+        let bucket_count = self.output_buckets.0.buckets();
         assert!(self.loss_fn.is_none(), "Can't specify loss function separately!");
         self.build_custom_internal(|inputs, nnz, targets, builder| {
             let stm = builder.new_sparse_input("stm", Shape::new(inputs, 1), nnz);
-            let buckets = builder.new_sparse_input("buckets", Shape::new(Out::BUCKETS, 1), 1);
+            let buckets = builder.new_sparse_input("buckets", Shape::new(bucket_count, 1), 1);
             f(builder, (stm, buckets), targets)
         })
     }
@@ -407,11 +410,12 @@ where
     where
         F: for<'a> Fn(Nb<'a>, (Nbn<'a>, Nbn<'a>, Nbn<'a>), Nbn<'a>) -> (Nbn<'a>, Nbn<'a>),
     {
+        let bucket_count = self.output_buckets.0.buckets();
         assert!(self.loss_fn.is_none(), "Can't specify loss function separately!");
         self.build_custom_internal(|inputs, nnz, targets, builder| {
             let stm = builder.new_sparse_input("stm", Shape::new(inputs, 1), nnz);
             let ntm = builder.new_sparse_input("nstm", Shape::new(inputs, 1), nnz);
-            let buckets = builder.new_sparse_input("buckets", Shape::new(Out::BUCKETS, 1), 1);
+            let buckets = builder.new_sparse_input("buckets", Shape::new(bucket_count, 1), 1);
             f(builder, (stm, ntm, buckets), targets)
         })
     }

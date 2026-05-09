@@ -671,6 +671,13 @@ fn main() {
     println!("Scale: {}", args.scale);
     match bucket_impl {
         ShogiLayerStackBucket9::KingRank9 => println!("Bucket mode: kingrank9"),
+        ShogiLayerStackBucket9::KingBucketTable(table) => {
+            println!(
+                "Bucket mode: kingbuckettable ({} half buckets, {} buckets)",
+                table.num_half_buckets(),
+                table.buckets()
+            );
+        }
         ShogiLayerStackBucket9::Ply9(bounds) => {
             println!("Bucket mode: ply9");
             println!("Ply bounds: {:?}", bounds);

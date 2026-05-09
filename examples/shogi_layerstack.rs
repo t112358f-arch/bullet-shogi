@@ -46,9 +46,10 @@ use bullet_lib::{
         ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
     },
     game::outputs::{
-        SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
-        SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES, SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES,
-        ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
+        OutputBuckets, ShogiKingBucketTable, ShogiLayerStackBucket9, ShogiProgressBucket8,
+        ShogiProgressBucket8GikouLite, ShogiProgressKPAbs, SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS,
+        SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER,
+        SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
     },
     nn::{
         Affine, InitSettings, ModelNode, Shape,
@@ -56,10 +57,10 @@ use bullet_lib::{
     },
     trainer::{
         save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
+        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
 };
 use bullet_trainer::model::save::ModelWeights;
 
@@ -87,7 +88,6 @@ use serde::{Deserialize, Serialize};
 // Constants
 // =============================================================================
 
-const NUM_BUCKETS: usize = 9;
 const QA: i16 = 127;
 const QB: i16 = 64;
 
@@ -115,22 +115,14 @@ enum OptimizerType {
 enum BucketMode {
     #[default]
     Kingrank9,
+    #[value(name = "kingbuckettable")]
+    KingBucketTable,
     Ply9,
     Progress8,
     #[value(name = "progress8gikou")]
     Progress8Gikou,
     #[value(name = "progress8kpabs")]
     Progress8KPAbs,
-}
-
-/// PSQT ショートカット層の初期化方式
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum PsqtInit {
-    /// ゼロ初期化 (v87/v88 互換、学習初期は PSQT なしと等価)
-    #[default]
-    Zeroed,
-    /// 駒の Material 値で初期化 (Stockfish 風、学習開始から有効な prior)
-    Material,
 }
 
 #[derive(Parser, Debug)]
@@ -263,9 +255,13 @@ struct Args {
     #[arg(long, default_value_t = 600.0, requires = "wrm_in_scaling")]
     wrm_nnue2score: f32,
 
-    /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
+    /// Output bucket mode (kingrank9 / kingbuckettable / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
+
+    /// King bucket table JSON path for --bucket-mode kingbuckettable
+    #[arg(long)]
+    king_bucket_table: Option<PathBuf>,
 
     /// Optional boundaries for ply9 buckets (8 comma-separated values)
     #[arg(long)]
@@ -274,15 +270,6 @@ struct Args {
     /// Enable PSQT shortcut layer
     #[arg(long, default_value_t = false)]
     psqt: bool,
-
-    /// PSQT 重みの初期化方式 (`zeroed` / `material`)
-    ///
-    /// - `zeroed`: 0 で初期化（従来動作、v87/v88 互換）
-    /// - `material`: 駒の Material 値で初期化（Stockfish 風の prior）
-    ///
-    /// `--psqt` が必須（未指定で本フラグを使うと clap がエラーで終了する）。
-    #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
-    psqt_init: PsqtInit,
 
     /// Enable Threat concatenated input
     #[arg(long, default_value_t = false)]
@@ -341,6 +328,12 @@ struct ProgressStandardization {
 #[derive(Debug, Deserialize)]
 struct ProgressRuntime {
     z_clip: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KingBucketTableJson {
+    num_half_buckets: usize,
+    table: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,7 +396,11 @@ impl Args {
     }
 
     fn interleave_batches_value(&self) -> Option<usize> {
-        if self.interleave_file_batches == 0 { None } else { Some(self.interleave_file_batches) }
+        if self.interleave_file_batches == 0 {
+            None
+        } else {
+            Some(self.interleave_file_batches)
+        }
     }
 
     fn validate_wrm_settings(&self) -> Result<(), String> {
@@ -439,6 +436,8 @@ impl Args {
             BucketMode::Kingrank9 => {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else if self.king_bucket_table.is_some() {
+                    Err("--king-bucket-table can only be used with --bucket-mode kingbuckettable".to_string())
                 } else if self.progress_coeff.is_some() {
                     Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
                         .to_string())
@@ -446,8 +445,22 @@ impl Args {
                     Ok(None)
                 }
             }
+            BucketMode::KingBucketTable => {
+                if self.ply_bounds.is_some() {
+                    Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else if self.progress_coeff.is_some() {
+                    Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
+                        .to_string())
+                } else if self.king_bucket_table.is_none() {
+                    Err("--bucket-mode kingbuckettable requires --king-bucket-table".to_string())
+                } else {
+                    Ok(None)
+                }
+            }
             BucketMode::Ply9 => {
-                if self.progress_coeff.is_some() {
+                if self.king_bucket_table.is_some() {
+                    Err("--king-bucket-table can only be used with --bucket-mode kingbuckettable".to_string())
+                } else if self.progress_coeff.is_some() {
                     Err("--progress-coeff can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
                         .to_string())
                 } else {
@@ -460,6 +473,8 @@ impl Args {
             BucketMode::Progress8 | BucketMode::Progress8Gikou | BucketMode::Progress8KPAbs => {
                 if self.ply_bounds.is_some() {
                     Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
+                } else if self.king_bucket_table.is_some() {
+                    Err("--king-bucket-table can only be used with --bucket-mode kingbuckettable".to_string())
                 } else {
                     Ok(None)
                 }
@@ -470,6 +485,7 @@ impl Args {
     fn bucket_mode_name(&self) -> &'static str {
         match self.bucket_mode {
             BucketMode::Kingrank9 => "kingrank9",
+            BucketMode::KingBucketTable => "kingbuckettable",
             BucketMode::Ply9 => "ply9",
             BucketMode::Progress8 => "progress8",
             BucketMode::Progress8Gikou => "progress8gikou",
@@ -510,6 +526,27 @@ impl Args {
             }
         }
     }
+
+    fn load_king_bucket_table(&self) -> Result<Option<ShogiKingBucketTable>, String> {
+        match self.bucket_mode {
+            BucketMode::KingBucketTable => {
+                let path = self
+                    .king_bucket_table
+                    .as_ref()
+                    .ok_or_else(|| "--bucket-mode kingbuckettable requires --king-bucket-table".to_string())?;
+                load_king_bucket_table_from_json(path).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn load_king_bucket_table_from_json(path: &PathBuf) -> Result<ShogiKingBucketTable, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --king-bucket-table '{}': {e}", path.display()))?;
+    let table: KingBucketTableJson = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse king bucket table JSON '{}': {e}", path.display()))?;
+    ShogiKingBucketTable::load_from_readable_table(table.num_half_buckets, &table.table)
 }
 
 fn load_progress_bucket_v1_from_json(path: &PathBuf) -> Result<ShogiProgressBucket8, String> {
@@ -666,6 +703,7 @@ struct ExperimentParams {
     num_buckets: usize,
     bucket_mode: String,
     ply_bounds: Option<[u16; 8]>,
+    king_bucket_table: Option<String>,
     progress_coeff: Option<String>,
     lr: f32,
     lr_gamma: f32,
@@ -1080,331 +1118,6 @@ fn compute_layerstack_fc_hash(l1_out: usize, l2_in: usize, l2_out: usize) -> u32
 }
 
 // =============================================================================
-// PSQT Material 初期化
-// =============================================================================
-
-/// 駒種別 Material 値（centipawn）
-///
-/// 将棋の標準的な駒価値。成駒は生駒 × 1.2 倍で扱う。
-/// 玉は評価値に寄与しないため 0。
-///
-/// 生駒: 歩=100, 香=300, 桂=320, 銀=500, 金=550, 角=850, 飛=1000
-/// 成駒: 馬=1020 (角×1.2), 龍=1200 (飛×1.2)
-///       成歩/成香/成桂/成銀 は BonaPiece 上で Gold と同一スロットに統合される
-///       ため Gold の 550 を割り当てる（区別不能）
-mod psqt_material {
-    pub const PAWN_CP: f32 = 100.0;
-    pub const LANCE_CP: f32 = 300.0;
-    pub const KNIGHT_CP: f32 = 320.0;
-    pub const SILVER_CP: f32 = 500.0;
-    pub const GOLD_CP: f32 = 550.0;
-    pub const BISHOP_CP: f32 = 850.0;
-    pub const ROOK_CP: f32 = 1000.0;
-    pub const HORSE_CP: f32 = BISHOP_CP * 1.2; // 1020
-    pub const DRAGON_CP: f32 = ROOK_CP * 1.2; // 1200
-}
-
-/// packed BonaPiece (0..=1628、計 PIECE_INPUTS=1629 要素) → Material 値
-/// （centipawn、friend=+, enemy=-）のルックアップを構築
-///
-/// BonaPiece レイアウト (bullet_lib::shogi::bona_piece)：
-/// - 手駒: 1..=89 (未使用スロットあり)
-/// - 盤上駒: 90..=1547 (各駒種 × 2色 × 81マス)
-/// - 王: 1548..=1628 (friend/enemy は pack 後同一平面)
-///
-/// pack_bonapiece 処理後の packed 値を想定：生の BonaPiece ではなく、
-/// shogi_halfka.rs::pack_bonapiece を通した後の値（E_KING は 1548 に丸め込まれる）。
-fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INPUTS] {
-    use bullet_lib::shogi::bona_piece::{
-        E_BISHOP, E_DRAGON, E_GOLD, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK,
-        E_HAND_SILVER, E_HORSE, E_KNIGHT, E_LANCE, E_PAWN, E_ROOK, E_SILVER, F_BISHOP, F_DRAGON, F_GOLD, F_HAND_BISHOP,
-        F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_HORSE, F_KNIGHT, F_LANCE,
-        F_PAWN, F_ROOK, F_SILVER,
-    };
-    use psqt_material::*;
-
-    let mut table = [0.0f32; bullet_lib::game::inputs::PIECE_INPUTS];
-
-    // 手駒スロット
-    // friend の手駒: +material × 枚数分のスロットを連番で埋める
-    // enemy の手駒: -material
-    let fill = |table: &mut [f32], base: u16, count: u16, value: f32| {
-        for i in 0..count {
-            table[(base + i) as usize] = value;
-        }
-    };
-
-    // 手駒（最大枚数: 歩18, 香/桂/銀/金4, 角/飛2）
-    fill(&mut table, F_HAND_PAWN, 18, PAWN_CP);
-    fill(&mut table, E_HAND_PAWN, 18, -PAWN_CP);
-    fill(&mut table, F_HAND_LANCE, 4, LANCE_CP);
-    fill(&mut table, E_HAND_LANCE, 4, -LANCE_CP);
-    fill(&mut table, F_HAND_KNIGHT, 4, KNIGHT_CP);
-    fill(&mut table, E_HAND_KNIGHT, 4, -KNIGHT_CP);
-    fill(&mut table, F_HAND_SILVER, 4, SILVER_CP);
-    fill(&mut table, E_HAND_SILVER, 4, -SILVER_CP);
-    fill(&mut table, F_HAND_GOLD, 4, GOLD_CP);
-    fill(&mut table, E_HAND_GOLD, 4, -GOLD_CP);
-    fill(&mut table, F_HAND_BISHOP, 2, BISHOP_CP);
-    fill(&mut table, E_HAND_BISHOP, 2, -BISHOP_CP);
-    fill(&mut table, F_HAND_ROOK, 2, ROOK_CP);
-    fill(&mut table, E_HAND_ROOK, 2, -ROOK_CP);
-
-    // 盤上駒（各駒種で 81 マス分連続）
-    fill(&mut table, F_PAWN, 81, PAWN_CP);
-    fill(&mut table, E_PAWN, 81, -PAWN_CP);
-    fill(&mut table, F_LANCE, 81, LANCE_CP);
-    fill(&mut table, E_LANCE, 81, -LANCE_CP);
-    fill(&mut table, F_KNIGHT, 81, KNIGHT_CP);
-    fill(&mut table, E_KNIGHT, 81, -KNIGHT_CP);
-    fill(&mut table, F_SILVER, 81, SILVER_CP);
-    fill(&mut table, E_SILVER, 81, -SILVER_CP);
-    // Gold スロットは成歩/成香/成桂/成銀も同じ slot に統合される（区別不能）
-    fill(&mut table, F_GOLD, 81, GOLD_CP);
-    fill(&mut table, E_GOLD, 81, -GOLD_CP);
-    fill(&mut table, F_BISHOP, 81, BISHOP_CP);
-    fill(&mut table, E_BISHOP, 81, -BISHOP_CP);
-    fill(&mut table, F_HORSE, 81, HORSE_CP);
-    fill(&mut table, E_HORSE, 81, -HORSE_CP);
-    fill(&mut table, F_ROOK, 81, ROOK_CP);
-    fill(&mut table, E_ROOK, 81, -ROOK_CP);
-    fill(&mut table, F_DRAGON, 81, DRAGON_CP);
-    fill(&mut table, E_DRAGON, 81, -DRAGON_CP);
-
-    // 王は両側とも 0（評価値に寄与しない）
-    // F_KING..E_KING+81 は既に 0 で初期化済み
-
-    table
-}
-
-/// PSQT 重みの Material 初期値を計算
-///
-/// `psqtw` の shape は `(NUM_BUCKETS, input_size)`（列優先）。
-/// 列ごと（feature ごと）に同じ Material 値を NUM_BUCKETS 個並べて返す。
-///
-/// feature index → packed BonaPiece へのマッピング：
-///   `feat = king_bucket * PIECE_INPUTS + packed_bp`（`halfka_index` 定義）
-///   `packed_bp = feat % PIECE_INPUTS` を King バケット横断で共有
-///
-/// `input_size > halfka_dim` の場合（Threat/HandThreat 結合時）、
-/// halfka 以外の特徴量は 0 で埋める。
-///
-/// `nnue2score_scale` は centipawn → 内部スケールへの変換係数（通常 `args.wrm_nnue2score`、
-/// デフォルト 600.0）。これで割ることで float 重みが訓練時の net_output スケールに揃う。
-fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score_scale: f32) -> Vec<f32> {
-    use bullet_lib::game::inputs::PIECE_INPUTS;
-
-    assert!(input_size >= halfka_dim, "input_size must be >= halfka_dim");
-    assert!(nnue2score_scale > 0.0, "nnue2score_scale must be positive");
-    assert_eq!(halfka_dim % PIECE_INPUTS, 0, "halfka_dim must be a multiple of PIECE_INPUTS");
-
-    let packed_material = build_packed_bp_material_table();
-    let num_king_buckets = halfka_dim / PIECE_INPUTS;
-
-    // 重み配列: input_size 個の列、各列に NUM_BUCKETS 個の値
-    let mut vals = vec![0.0f32; NUM_BUCKETS * input_size];
-
-    for kb in 0..num_king_buckets {
-        for (bp, &material) in packed_material.iter().enumerate() {
-            let feat = kb * PIECE_INPUTS + bp;
-            let value = material / nnue2score_scale;
-            let base = feat * NUM_BUCKETS;
-            for slot in vals.iter_mut().skip(base).take(NUM_BUCKETS) {
-                *slot = value;
-            }
-        }
-    }
-
-    // input_size > halfka_dim（Threat/HandThreat）部分は 0 のまま
-    vals
-}
-
-#[cfg(test)]
-mod psqt_material_tests {
-    use super::*;
-    use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
-    use bullet_lib::shogi::bona_piece::{
-        E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_PAWN,
-        F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING,
-        F_PAWN, F_ROOK,
-    };
-
-    #[test]
-    fn packed_bp_material_signs_and_magnitudes() {
-        let table = build_packed_bp_material_table();
-
-        // 友 (F_*) は正、敵 (E_*) は負
-        assert_eq!(table[F_PAWN as usize], psqt_material::PAWN_CP);
-        assert_eq!(table[E_PAWN as usize], -psqt_material::PAWN_CP);
-        assert_eq!(table[F_HAND_PAWN as usize], psqt_material::PAWN_CP);
-        assert_eq!(table[E_HAND_PAWN as usize], -psqt_material::PAWN_CP);
-        assert_eq!(table[F_ROOK as usize], psqt_material::ROOK_CP);
-
-        // 玉は評価値に寄与しない: pack 後は friend 側 81 マス平面に統合される。
-        // 全 81 スロットが 0 であることを確認。
-        for i in 0..81 {
-            assert_eq!(table[(F_KING + i) as usize], 0.0, "F_KING+{i}");
-        }
-
-        // 0 (ダミー) は常に 0
-        assert_eq!(table[0], 0.0);
-    }
-
-    /// 手駒の枚数スロット連番と境界（gap）の 0 を全駒種で検証。
-    /// BonaPiece レイアウト変更時の検出力を上げるための回帰テスト。
-    #[test]
-    fn hand_count_slots_and_gap_boundaries() {
-        use psqt_material::*;
-        let table = build_packed_bp_material_table();
-
-        // 各手駒駒種について：(F_base, E_base, count, value)
-        let cases: &[(u16, u16, u16, f32)] = &[
-            (F_HAND_PAWN, E_HAND_PAWN, 18, PAWN_CP),
-            (F_HAND_LANCE, E_HAND_LANCE, 4, LANCE_CP),
-            (F_HAND_KNIGHT, E_HAND_KNIGHT, 4, KNIGHT_CP),
-            (F_HAND_SILVER, E_HAND_SILVER, 4, SILVER_CP),
-            (F_HAND_GOLD, E_HAND_GOLD, 4, GOLD_CP),
-            (F_HAND_BISHOP, E_HAND_BISHOP, 2, BISHOP_CP),
-            (F_HAND_ROOK, E_HAND_ROOK, 2, ROOK_CP),
-        ];
-
-        for &(f_base, e_base, count, value) in cases {
-            // 友 / 敵: count 個の連続スロットが ±value、count 個目（0-index で count）は gap
-            for i in 0..count {
-                assert_eq!(table[(f_base + i) as usize], value, "F base={f_base} i={i}");
-                assert_eq!(table[(e_base + i) as usize], -value, "E base={e_base} i={i}");
-            }
-            // 友/敵の各駒種スロット直後は次の駒種までの gap (=0)。
-            // ただし E_HAND_ROOK+2 = 90 = F_PAWN（盤上）なので gap は手駒領域内 (<F_PAWN) のみ検証。
-            let f_gap = f_base + count;
-            let e_gap = e_base + count;
-            if f_gap < F_PAWN {
-                assert_eq!(table[f_gap as usize], 0.0, "F gap base={f_base}");
-            }
-            if e_gap < F_PAWN {
-                assert_eq!(table[e_gap as usize], 0.0, "E gap base={e_base}");
-            }
-        }
-    }
-
-    #[test]
-    fn material_values_respect_layout_and_scale() {
-        const SCALE: f32 = 600.0;
-        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, SCALE);
-
-        assert_eq!(vals.len(), NUM_BUCKETS * HALFKA_HM_DIMENSIONS);
-
-        // 先手歩（F_PAWN=90, kb=0）の重み: PAWN_CP / SCALE が NUM_BUCKETS 個並ぶ
-        let feat_f_pawn = 0 * PIECE_INPUTS + F_PAWN as usize;
-        let expected_pawn = psqt_material::PAWN_CP / SCALE;
-        for bucket in 0..NUM_BUCKETS {
-            assert!((vals[feat_f_pawn * NUM_BUCKETS + bucket] - expected_pawn).abs() < 1e-6);
-        }
-
-        // 後手歩（E_PAWN, kb=44）の重みは負
-        let feat_e_pawn_top_kb = (NUM_KING_BUCKETS - 1) * PIECE_INPUTS + E_PAWN as usize;
-        let expected_e_pawn = -psqt_material::PAWN_CP / SCALE;
-        for bucket in 0..NUM_BUCKETS {
-            assert!((vals[feat_e_pawn_top_kb * NUM_BUCKETS + bucket] - expected_e_pawn).abs() < 1e-6);
-        }
-
-        // 玉スロットは 0（全バケット共通）
-        let feat_f_king = 0 * PIECE_INPUTS + F_KING as usize;
-        for bucket in 0..NUM_BUCKETS {
-            assert_eq!(vals[feat_f_king * NUM_BUCKETS + bucket], 0.0);
-        }
-    }
-
-    #[test]
-    fn material_values_zero_out_threat_tail() {
-        // input_size > halfka_dim の場合、halfka 以降は 0 のまま
-        const SCALE: f32 = 290.0;
-        let threat_dim = 5000;
-        let total = HALFKA_HM_DIMENSIONS + threat_dim;
-        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, total, SCALE);
-
-        assert_eq!(vals.len(), NUM_BUCKETS * total);
-
-        // halfka 以降は全て 0
-        for feat in HALFKA_HM_DIMENSIONS..total {
-            for bucket in 0..NUM_BUCKETS {
-                assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0);
-            }
-        }
-    }
-
-    /// 実際の HandThreat / Threat (profile=0) 次元での tail 0 検証。
-    /// 構造体の `num_inputs()` を実値として使用し、定数仮定が崩れた場合の検出力を上げる。
-    #[test]
-    fn material_values_zero_tail_with_real_extension_dims() {
-        const SCALE: f32 = 600.0;
-        let halfka = ShogiHalfKA_hm.num_inputs();
-        assert_eq!(halfka, HALFKA_HM_DIMENSIONS);
-
-        // HandThreat (案 A)
-        {
-            let total = ShogiHalfKaHmHandThreat::new().num_inputs();
-            assert!(total > halfka, "HandThreat input dim must exceed halfka_dim");
-            let vals = compute_psqt_material_values(halfka, total, SCALE);
-            for feat in halfka..total {
-                for bucket in 0..NUM_BUCKETS {
-                    assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0, "HandThreat tail feat={feat}");
-                }
-            }
-        }
-
-        // HandThreat defensive
-        {
-            let total = ShogiHalfKaHmHandThreatDefensive::new().num_inputs();
-            assert!(total > halfka);
-            let vals = compute_psqt_material_values(halfka, total, SCALE);
-            for feat in halfka..total {
-                for bucket in 0..NUM_BUCKETS {
-                    assert_eq!(vals[feat * NUM_BUCKETS + bucket], 0.0, "HandThreatDefensive tail feat={feat}");
-                }
-            }
-        }
-    }
-
-    /// 全 45 King バケット × 全 9 Output バケットで Material 値が一様であることを
-    /// 駒種ごとに検証。bucket 依存混入の回帰検出力を担保する。
-    #[test]
-    fn material_values_uniform_across_all_king_and_output_buckets() {
-        const SCALE: f32 = 600.0;
-        let vals = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, SCALE);
-        let table = build_packed_bp_material_table();
-
-        // 代表的な駒種：歩(F/E)・飛(F/E)・玉(F)・手駒歩(F/E)
-        let probes: &[u16] = &[F_PAWN, E_PAWN, F_ROOK, F_KING, F_HAND_PAWN, E_HAND_PAWN];
-        for &bp in probes {
-            let expected = table[bp as usize] / SCALE;
-            for kb in 0..NUM_KING_BUCKETS {
-                let feat = kb * PIECE_INPUTS + bp as usize;
-                for bucket in 0..NUM_BUCKETS {
-                    let v = vals[feat * NUM_BUCKETS + bucket];
-                    assert!(
-                        (v - expected).abs() < 1e-6,
-                        "non-uniform at bp={bp} kb={kb} bucket={bucket}: v={v} expected={expected}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn material_values_scale_inverse_proportional() {
-        // scale を 2倍にしたら float 重みは 1/2 になる
-        let vals_600 = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, 600.0);
-        let vals_300 = compute_psqt_material_values(HALFKA_HM_DIMENSIONS, HALFKA_HM_DIMENSIONS, 300.0);
-
-        let feat_f_pawn = F_PAWN as usize;
-        let v600 = vals_600[feat_f_pawn * NUM_BUCKETS];
-        let v300 = vals_300[feat_f_pawn * NUM_BUCKETS];
-        assert!((v300 - v600 * 2.0).abs() < 1e-4, "v300={v300}, v600={v600}");
-    }
-}
-
-// =============================================================================
 // SavedFormat Construction
 // =============================================================================
 
@@ -1422,6 +1135,7 @@ fn build_layerstack_save_format(
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    num_buckets: usize,
     fv_scale: i32,
     psqt: bool,
     threat_profile: Option<ThreatProfile>,
@@ -1439,7 +1153,7 @@ fn build_layerstack_save_format(
     let network_hash = fc_hash ^ ft_hash;
 
     // アーキテクチャ文字列（fv_scale を埋め込み、rshogi が推論時に正しく解釈できるようにする）
-    let psqt_part = if psqt { format!("PSQT={},", NUM_BUCKETS) } else { String::new() };
+    let psqt_part = if psqt { format!("PSQT={},", num_buckets) } else { String::new() };
     let threat_part = if let Some(tp) = threat_profile {
         let threat_dims = input_size - halfka_dim;
         let pid = tp.profile_id();
@@ -1546,26 +1260,27 @@ fn build_layerstack_save_format(
     let psqt_data = if psqt {
         // PSQT は HalfKA 特徴量のみ対象。Threat 部分は含めない。
         let input_size_for_psqt = halfka_dim;
+        let num_buckets_for_psqt = num_buckets;
         Some(
             SavedFormat::empty()
                 .transform(move |graph, _| {
-                    let psqt_w = weight_view(graph, "psqtw"); // [NUM_BUCKETS, input_size] column-major
-                    let psqt_b = weight_view(graph, "psqtb"); // [NUM_BUCKETS]
+                    let psqt_w = weight_view(graph, "psqtw"); // [num_buckets, input_size] column-major
+                    let psqt_b = weight_view(graph, "psqtb"); // [num_buckets]
 
                     let scale = (QA as i32 * QB as i32) as f64; // 8128.0
                     let mut bytes: Vec<u8> = Vec::new();
 
-                    // Biases: i32[9]
-                    for bucket in 0..NUM_BUCKETS {
+                    // Biases: i32[num_buckets]
+                    for bucket in 0..num_buckets_for_psqt {
                         let val = (scale * psqt_b.values[bucket] as f64).round() as i32;
                         bytes.extend_from_slice(&val.to_le_bytes());
                     }
 
-                    // Weights: i32[input_size][9] (feature-major)
+                    // Weights: i32[input_size][num_buckets] (feature-major)
                     for feat in 0..input_size_for_psqt {
-                        for bucket in 0..NUM_BUCKETS {
+                        for bucket in 0..num_buckets_for_psqt {
                             // column-major: feat * rows + bucket
-                            let w = psqt_w.values[feat * NUM_BUCKETS + bucket];
+                            let w = psqt_w.values[feat * num_buckets_for_psqt + bucket];
                             let val = (scale * w as f64).round() as i32;
                             bytes.extend_from_slice(&val.to_le_bytes());
                         }
@@ -1643,9 +1358,9 @@ fn build_layerstack_save_format(
     // 各バケットについて: fc_hash + L1(biases, weights) + L2(biases, weights) + Output(bias, weights)
     //
     // bullet内部の重みレイアウト:
-    //   l1w: column-major [NUM_BUCKETS * l1_out, ft_out] (= [rows, cols])
-    //   l2w: column-major [NUM_BUCKETS * l2_out, l2_in]
-    //   l3w: column-major [NUM_BUCKETS * 1, l2_out]
+    //   l1w: column-major [num_buckets * l1_out, ft_out] (= [rows, cols])
+    //   l2w: column-major [num_buckets * l2_out, l2_in]
+    //   l3w: column-major [num_buckets * 1, l2_out]
     //
     // rshogi の期待レイアウト (per bucket):
     //   L1 weights: [l1_out × pad32(ft_out)] row-major, つまり weight[out][padded_in]
@@ -1661,6 +1376,7 @@ fn build_layerstack_save_format(
     let ft_out_for_ls = ft_out;
     let fc_hash_captured = fc_hash;
     let hand_count_dense_dims_captured = hand_count_dense_dims;
+    let num_buckets_captured = num_buckets;
     let layerstack_data = SavedFormat::empty()
         .transform(move |graph, _| {
             let l1w = weight_view(graph, "l1w");
@@ -1677,7 +1393,7 @@ fn build_layerstack_save_format(
 
             let mut output_bytes: Vec<u8> = Vec::new();
 
-            for bucket in 0..NUM_BUCKETS {
+            for bucket in 0..num_buckets_captured {
                 // fc_hash per bucket
                 output_bytes.extend_from_slice(&fc_hash_captured.to_le_bytes());
 
@@ -1692,7 +1408,7 @@ fn build_layerstack_save_format(
 
                 // Weights: i8, scale = QB = 64
                 // bullet:
-                //   l1w  = [NUM_BUCKETS * l1_out, ft_out + hand_count_dims]
+                //   l1w  = [num_buckets * l1_out, ft_out + hand_count_dims]
                 //   l1fw = [l1_out, ft_out]   (shared factorized part; hand_count は共有化しない)
                 //   weight[global_out * (ft_out + hc) + in_idx] where
                 //   global_out = bucket * l1_out + out_idx
@@ -1702,13 +1418,13 @@ fn build_layerstack_save_format(
                 // rshogi: row-major [l1_out × padded(ft_out + hc)]
                 let l1_total_in = ft_out_for_ls + hand_count_dense_dims_captured;
                 let l1_padded_in = pad32(l1_total_in);
-                let l1_rows_total = NUM_BUCKETS * l1_out_captured;
+                let l1_rows_total = num_buckets_captured * l1_out_captured;
                 for out_idx in 0..l1_out_captured {
                     let global_out = bucket * l1_out_captured + out_idx;
                     for in_idx in 0..l1_padded_in {
                         if in_idx < ft_out_for_ls {
                             // column-major indexing:
-                            //   l1w  shape [NUM_BUCKETS*l1_out, ft_out + hc] -> in * rows + out
+                            //   l1w  shape [num_buckets*l1_out, ft_out + hc] -> in * rows + out
                             //   l1fw shape [l1_out, ft_out]                  -> in * l1_out + out
                             let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
                             let shared_w = l1fw.values[in_idx * l1_out_captured + out_idx];
@@ -1737,12 +1453,12 @@ fn build_layerstack_save_format(
 
                 // Weights: i8, scale = QB = 64
                 let l2_padded_in = pad32(l2_in_captured);
-                let l2_rows_total = NUM_BUCKETS * l2_out_captured;
+                let l2_rows_total = num_buckets_captured * l2_out_captured;
                 for out_idx in 0..l2_out_captured {
                     let global_out = bucket * l2_out_captured + out_idx;
                     for in_idx in 0..l2_padded_in {
                         if in_idx < l2_in_captured {
-                            // l2w shape [NUM_BUCKETS*l2_out, l2_in], column-major
+                            // l2w shape [num_buckets*l2_out, l2_in], column-major
                             let w = l2w.values[in_idx * l2_rows_total + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
@@ -1767,8 +1483,8 @@ fn build_layerstack_save_format(
                     let global_out = bucket;
                     for in_idx in 0..output_padded_in {
                         if in_idx < l2_out_captured {
-                            // l3w shape [NUM_BUCKETS, l2_out], column-major
-                            let w = l3w.values[in_idx * NUM_BUCKETS + global_out];
+                            // l3w shape [num_buckets, l2_out], column-major
+                            let w = l3w.values[in_idx * num_buckets_captured + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -1827,6 +1543,31 @@ fn main() {
         eprintln!("ERROR: {}", e);
         std::process::exit(1);
     });
+    let king_bucket_table = args.load_king_bucket_table().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
+    let bucket_impl = match args.bucket_mode {
+        BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
+        BucketMode::KingBucketTable => match king_bucket_table {
+            Some(table) => ShogiLayerStackBucket9::KingBucketTable(table),
+            None => panic!("king bucket table must exist in kingbuckettable mode"),
+        },
+        BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
+        BucketMode::Progress8 => match progress_bucket {
+            Some(LoadedProgressBucket::V1(bucket)) => ShogiLayerStackBucket9::Progress8(bucket),
+            _ => panic!("progress coeff v1 must exist in progress8 mode"),
+        },
+        BucketMode::Progress8Gikou => match progress_bucket {
+            Some(LoadedProgressBucket::Gikou(bucket)) => ShogiLayerStackBucket9::Progress8GikouLite(bucket),
+            _ => panic!("progress coeff v2 must exist in progress8gikou mode"),
+        },
+        BucketMode::Progress8KPAbs => match progress_bucket {
+            Some(LoadedProgressBucket::KPAbs(bucket)) => ShogiLayerStackBucket9::Progress8KPAbs(bucket),
+            _ => panic!("progress.bin must exist in progress8kpabs mode"),
+        },
+    };
+    let num_buckets = bucket_impl.buckets();
 
     let ft_out = args.l0;
     let l1_out = args.l1;
@@ -1926,10 +1667,13 @@ fn main() {
             "disabled".to_string()
         }
     );
-    println!("Buckets: {}", NUM_BUCKETS);
+    println!("Buckets: {}", num_buckets);
     println!("Bucket mode: {}", args.bucket_mode_name());
     if let Some(bounds) = ply_bounds {
         println!("Ply bounds: {:?}", bounds);
+    }
+    if let Some(table) = &args.king_bucket_table {
+        println!("King bucket table: {}", table.display());
     }
     if let Some(coeff) = &args.progress_coeff {
         println!("Progress coeff: {}", coeff.display());
@@ -1975,9 +1719,10 @@ fn main() {
         l0: ft_out,
         l1: l1_out,
         l2: l2_out,
-        num_buckets: NUM_BUCKETS,
+        num_buckets,
         bucket_mode: args.bucket_mode_name().to_string(),
         ply_bounds,
+        king_bucket_table: args.king_bucket_table.as_ref().map(|p| p.display().to_string()),
         progress_coeff: args.progress_coeff.as_ref().map(|p| p.display().to_string()),
         lr: args.lr,
         lr_gamma: args.lr_gamma,
@@ -2086,6 +1831,7 @@ fn main() {
         ft_out,
         l1_out,
         l2_out,
+        num_buckets,
         fv_scale,
         args.psqt,
         threat_profile,
@@ -2099,81 +1845,10 @@ fn main() {
     let l1_effective_c = l1_effective;
     let l2_out_c = l2_out;
     let l2_in_c = l2_in;
+    let num_buckets_c = num_buckets;
     let use_psqt = args.psqt;
 
-    // PSQT 重みの初期化：
-    // - zeroed: Stockfish 未準拠。v87/v88 互換（学習初期は PSQT なしと等価）
-    // - material: 駒の cp 値 / scale を初期値とする（学習開始から prior あり）
-    //
-    // スケール選択は学習損失モードに依存する：
-    // - WRM 損失 (`--wrm-in-scaling` 指定) : `scorenet = output * wrm_nnue2score` により
-    //   net_output は「cp / wrm_nnue2score」のスケールで収束するため、重みの divisor
-    //   は `wrm_nnue2score` を用いる。
-    // - 純 sigmoid 損失 (WRM 未指定) : 教師 target は `sigmoid(cp / args.scale)` で
-    //   与えられるため net_output は「cp / args.scale」スケールで収束する。
-    //   divisor は `args.scale` を用いる。
-    //
-    // 許可しない組合せ（Codex review 指摘）：
-    // - `--psqt` + `--threat` / `--hand-threat` / `--hand-threat-defensive`
-    //   → PSQT 重みが `input_size` 次元で学習されるが、save format は先頭 `halfka_dim`
-    //      のみ書き出すため、Threat 尾部の学習済み重みが silently drop される。
-    //      rshogi 推論との不整合を避けるため組合せ禁止。
-    // - `--psqt-init material` + `--win-rate-model` without `--wrm-in-scaling`
-    //   → target は WRM 変換後、loss は sigmoid なので net_output は logit(WRM(cp))
-    //      空間となり `cp / args.scale` スケールの prior と整合しない。
-    if args.psqt && input_size > halfka_dim {
-        eprintln!(
-            "ERROR: --psqt と --threat / --hand-threat / --hand-threat-defensive の組合せは\n\
-             未対応です。PSQT 重みの Threat 尾部が量子化出力に含まれないため、学習と\n\
-             推論が乖離します。どちらか片方のみ指定してください。"
-        );
-        std::process::exit(1);
-    }
-    if matches!(args.psqt_init, PsqtInit::Material) && args.win_rate_model && args.wrm_in_scaling.is_none() {
-        eprintln!(
-            "ERROR: --psqt-init material は --win-rate-model 単独（--wrm-in-scaling 未指定）\n\
-             との組合せに非対応です。この場合 net_output は logit(WRM(cp)) 空間で収束するため\n\
-             centipawn / scale の prior と整合しません。--wrm-in-scaling を追加するか、\n\
-             --psqt-init zeroed を使用してください。"
-        );
-        std::process::exit(1);
-    }
-
-    let psqt_init_settings: InitSettings = match (args.psqt, args.psqt_init) {
-        (false, _) => InitSettings::Zeroed,
-        (true, PsqtInit::Zeroed) => {
-            println!("PSQT init: Zeroed");
-            InitSettings::Zeroed
-        }
-        (true, PsqtInit::Material) => {
-            let (scale, scale_label) = if args.wrm_in_scaling.is_some() {
-                (args.wrm_nnue2score, "wrm_nnue2score")
-            } else {
-                (args.scale as f32, "scale")
-            };
-            println!("PSQT init: Material (centipawn 値 / {scale} [{scale_label}] を float 重みとして使用)");
-            let values = compute_psqt_material_values(halfka_dim, input_size, scale);
-            InitSettings::Const { values }
-        }
-    };
-    let bucket_impl = match args.bucket_mode {
-        BucketMode::Kingrank9 => ShogiLayerStackBucket9::KingRank9,
-        BucketMode::Ply9 => ShogiLayerStackBucket9::Ply9(ply_bounds.expect("ply bounds must exist in ply9 mode")),
-        BucketMode::Progress8 => match progress_bucket {
-            Some(LoadedProgressBucket::V1(bucket)) => ShogiLayerStackBucket9::Progress8(bucket),
-            _ => panic!("progress coeff v1 must exist in progress8 mode"),
-        },
-        BucketMode::Progress8Gikou => match progress_bucket {
-            Some(LoadedProgressBucket::Gikou(bucket)) => ShogiLayerStackBucket9::Progress8GikouLite(bucket),
-            _ => panic!("progress coeff v2 must exist in progress8gikou mode"),
-        },
-        BucketMode::Progress8KPAbs => match progress_bucket {
-            Some(LoadedProgressBucket::KPAbs(bucket)) => ShogiLayerStackBucket9::Progress8KPAbs(bucket),
-            _ => panic!("progress.bin must exist in progress8kpabs mode"),
-        },
-    };
-
-    type Nbn<'a> = ModelNode<'a>;
+     type Nbn<'a> = ModelNode<'a>;
 
     /// Loss function: WRM applied to network output (nodchip style).
     fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
@@ -2228,14 +1903,14 @@ fn main() {
                 let l1 = Affine {
                     weights: builder.new_weights(
                         "l1w",
-                        Shape::new(NUM_BUCKETS * l1_out_c, l1_in_total),
+                        Shape::new(num_buckets_c * l1_out_c, l1_in_total),
                         InitSettings::Zeroed,
                     ),
-                    bias: builder.new_weights("l1b", Shape::new(NUM_BUCKETS * l1_out_c, 1), InitSettings::Zeroed),
+                    bias: builder.new_weights("l1b", Shape::new(num_buckets_c * l1_out_c, 1), InitSettings::Zeroed),
                 };
                 let l1f = builder.new_affine("l1f", ft_out_c, l1_out_c);
-                let l2 = builder.new_affine("l2", l2_in_c, NUM_BUCKETS * l2_out_c);
-                let l3 = builder.new_affine("l3", l2_out_c, NUM_BUCKETS);
+                let l2 = builder.new_affine("l2", l2_in_c, num_buckets_c * l2_out_c);
+                let l3 = builder.new_affine("l3", l2_out_c, num_buckets_c);
 
                 // Forward pass
                 let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
@@ -2266,14 +1941,14 @@ fn main() {
 
                 if use_psqt {
                     // PSQT shortcut: FT と同じ入力、出力 = バケット数
-                    // 初期化方式は --psqt-init で制御（zeroed / material）
+                    // 学習初期に「PSQTなし」と等価にするため Zeroed で開始
                     let psqt = Affine {
                         weights: builder.new_weights(
                             "psqtw",
-                            Shape::new(NUM_BUCKETS, input_size),
-                            psqt_init_settings.clone(),
+                            Shape::new(num_buckets_c, input_size),
+                            InitSettings::Zeroed,
                         ),
-                        bias: builder.new_weights("psqtb", Shape::new(NUM_BUCKETS, 1), InitSettings::Zeroed),
+                        bias: builder.new_weights("psqtb", Shape::new(num_buckets_c, 1), InitSettings::Zeroed),
                     };
 
                     // PSQT shortcut (Stockfish 準拠: (stm - nstm) / 2)
